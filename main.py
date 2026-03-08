@@ -14,7 +14,7 @@ os.environ['REQUESTS_CA_BUNDLE'] = certifi.where()
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
 
-DB_PATH = os.path.expanduser("~/Bookstore/bookstore.db")
+DB_PATH = os.path.expanduser("~/Desktop/Bookstore/bookstore.db")
 os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
 
 DAYS = {0: "Monday", 1: "Tuesday", 2: "Wednesday",
