@@ -14,7 +14,7 @@ os.environ['REQUESTS_CA_BUNDLE'] = certifi.where()
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
 
-DB_PATH = os.path.expanduser("~/Desktop/Bookstore/bookstore.db")
+DB_PATH = os.path.expanduser("~/Bookstore/bookstore.db")
 os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
 
 DAYS = {0: "Monday", 1: "Tuesday", 2: "Wednesday",
@@ -350,6 +350,19 @@ def init_db():
         CREATE TABLE IF NOT EXISTS genres (
             id   INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT UNIQUE NOT NULL
+        )
+    """)
+
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS wants (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            customer_id INTEGER NOT NULL,
+            title       TEXT,
+            author      TEXT,
+            isbn        TEXT,
+            notes       TEXT,
+            date_added  TEXT NOT NULL DEFAULT (date('now')),
+            fulfilled   INTEGER NOT NULL DEFAULT 0
         )
     """)
 
@@ -994,6 +1007,74 @@ def delete_customer(customer_id):
     c = conn.cursor()
     c.execute("DELETE FROM customers WHERE id=?", (customer_id,))
     c.execute("DELETE FROM credit_log WHERE customer_id=?", (customer_id,))
+    c.execute("DELETE FROM wants WHERE customer_id=?", (customer_id,))
+    conn.commit()
+    conn.close()
+
+
+# ── Wants helpers ─────────────────────────────────────────────────────────────
+def add_want(customer_id, title, author, isbn, notes):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("""INSERT INTO wants (customer_id, title, author, isbn, notes)
+                 VALUES (?,?,?,?,?)""",
+              (customer_id, title or None, author or None, isbn or None, notes or None))
+    conn.commit()
+    conn.close()
+
+
+def get_wants_for_customer(customer_id):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("""SELECT id, title, author, isbn, notes, date_added
+                 FROM wants WHERE customer_id=? AND fulfilled=0
+                 ORDER BY date_added DESC""", (customer_id,))
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
+
+def delete_want(want_id):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("DELETE FROM wants WHERE id=?", (want_id,))
+    conn.commit()
+    conn.close()
+
+
+def check_wants(title, author, isbn):
+    """Return list of (customer_name, want_id, title, author, isbn, notes, date_added)
+    for any unfulfilled want that fuzzy-matches the given book."""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    conditions = []
+    params = []
+    if title:
+        conditions.append("(w.title IS NOT NULL AND w.title LIKE ?)")
+        params.append(f"%{title}%")
+    if author:
+        conditions.append("(w.author IS NOT NULL AND w.author LIKE ?)")
+        params.append(f"%{author}%")
+    if isbn:
+        conditions.append("(w.isbn IS NOT NULL AND w.isbn=?)")
+        params.append(isbn)
+    if not conditions:
+        conn.close()
+        return []
+    where = " OR ".join(conditions)
+    c.execute(f"""SELECT cu.name, w.id, w.title, w.author, w.isbn, w.notes, w.date_added
+                  FROM wants w JOIN customers cu ON cu.id=w.customer_id
+                  WHERE w.fulfilled=0 AND ({where})
+                  ORDER BY cu.name""", params)
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
+
+def mark_want_fulfilled(want_id):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("UPDATE wants SET fulfilled=1 WHERE id=?", (want_id,))
     conn.commit()
     conn.close()
 
@@ -1504,7 +1585,22 @@ class BookFormWindow(ctk.CTkToplevel):
                       self.author_var.get().strip(), genre_val,
                       price, self.location_var.get().strip())
         self.on_save()
+        self._check_wants(title, self.author_var.get().strip(),
+                          self.isbn_var.get().strip())
         self.destroy()
+
+    def _check_wants(self, title, author, isbn):
+        matches = check_wants(title, author, isbn)
+        if not matches:
+            return
+        lines = []
+        for cust_name, wid, wtitle, wauthor, wisbn, wnotes, wdate in matches:
+            detail = " / ".join(filter(None, [wtitle, wauthor, wisbn]))
+            lines.append(f"• {cust_name}  —  wants: {detail}"
+                         + (f"\n  Notes: {wnotes}" if wnotes else ""))
+        msg = ("A customer has this book on their wants list!\n\n"
+               + "\n".join(lines))
+        messagebox.showinfo("Want List Match!", msg, parent=self.master)
 
     def _cancel(self):
         if not self.book and self._invoice_no:
@@ -3096,6 +3192,119 @@ class DoNotTakeFormWindow(ctk.CTkToplevel):
         self.destroy()
 
 
+# ── Wants Dialogs ─────────────────────────────────────────────────────────────
+class AddWantDialog(ctk.CTkToplevel):
+    def __init__(self, parent, customer_id, on_save):
+        super().__init__(parent)
+        self.title("Add Want")
+        self.resizable(False, False)
+        self.grab_set()
+        self._customer_id = customer_id
+        self._on_save = on_save
+        pad = {"padx": 20, "pady": 6}
+
+        ctk.CTkLabel(self, text="Add Book to Want List",
+                     font=ctk.CTkFont(size=14, weight="bold")).pack(**pad)
+
+        for label, attr, placeholder in [
+            ("Title",          "title_var",  "Book title"),
+            ("Author (Last, First)", "author_var", "e.g. King, Stephen"),
+            ("ISBN",           "isbn_var",   "Optional"),
+            ("Notes",          "notes_var",  "Any details…"),
+        ]:
+            row = ctk.CTkFrame(self, fg_color="transparent")
+            row.pack(fill="x", **pad)
+            ctk.CTkLabel(row, text=label, width=140, anchor="w").pack(side="left")
+            var = ctk.StringVar()
+            setattr(self, attr, var)
+            ctk.CTkEntry(row, textvariable=var, width=280,
+                         placeholder_text=placeholder).pack(side="left")
+
+        btn_row = ctk.CTkFrame(self, fg_color="transparent")
+        btn_row.pack(fill="x", padx=20, pady=16)
+        ctk.CTkButton(btn_row, text="Add Want", fg_color="#2a9d8f",
+                      hover_color="#21867a", command=self._save).pack(side="left", padx=(0, 10))
+        ctk.CTkButton(btn_row, text="Cancel", fg_color="gray30",
+                      hover_color="gray40", command=self.destroy).pack(side="left")
+
+    def _save(self):
+        title  = self.title_var.get().strip()
+        author = self.author_var.get().strip()
+        isbn   = self.isbn_var.get().strip()
+        notes  = self.notes_var.get().strip()
+        if not title and not author and not isbn:
+            messagebox.showwarning("Missing Info",
+                                   "Please enter at least a title, author, or ISBN.",
+                                   parent=self)
+            return
+        add_want(self._customer_id, title, author, isbn, notes)
+        self._on_save()
+        self.destroy()
+
+
+class WantsDialog(ctk.CTkToplevel):
+    def __init__(self, parent, customer):
+        super().__init__(parent)
+        self.title(f"Want List — {customer['name']}")
+        self.geometry("640x420")
+        self.grab_set()
+        self._customer = customer
+        self._build_ui()
+        self._refresh()
+
+    def _build_ui(self):
+        top = ctk.CTkFrame(self, fg_color="transparent")
+        top.pack(fill="x", padx=16, pady=(12, 0))
+        ctk.CTkLabel(top, text=f"Want list for {self._customer['name']}",
+                     font=ctk.CTkFont(size=13, weight="bold")).pack(side="left")
+        ctk.CTkButton(top, text="+ Add Want", width=110, fg_color="#2a9d8f",
+                      hover_color="#21867a",
+                      command=self._open_add).pack(side="right")
+
+        table_frame = ctk.CTkFrame(self)
+        table_frame.pack(fill="both", expand=True, padx=16, pady=10)
+        cols = ("title", "author", "isbn", "notes", "date")
+        self.tree = ttk.Treeview(table_frame, columns=cols,
+                                  show="headings", selectmode="browse")
+        for col, heading, width in [
+            ("title",  "Title",  200), ("author", "Author", 140),
+            ("isbn",   "ISBN",    90), ("notes",  "Notes",  130),
+            ("date",   "Added",   80)]:
+            self.tree.heading(col, text=heading)
+            self.tree.column(col, width=width, minwidth=40)
+        vsb = ttk.Scrollbar(table_frame, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=vsb.set)
+        self.tree.pack(side="left", fill="both", expand=True)
+        vsb.pack(side="right", fill="y")
+
+        bottom = ctk.CTkFrame(self, fg_color="transparent")
+        bottom.pack(fill="x", padx=16, pady=(0, 12))
+        ctk.CTkButton(bottom, text="🗑  Remove Selected", fg_color="#e63946",
+                      hover_color="#c1121f", width=160,
+                      command=self._remove_selected).pack(side="left")
+
+    def _refresh(self):
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+        for row in get_wants_for_customer(self._customer["id"]):
+            wid, title, author, isbn, notes, date_added = row
+            self.tree.insert("", "end", iid=str(wid),
+                             values=(title or "", author or "", isbn or "",
+                                     notes or "", date_added or ""))
+
+    def _open_add(self):
+        AddWantDialog(self, self._customer["id"], on_save=self._refresh)
+
+    def _remove_selected(self):
+        sel = self.tree.selection()
+        if not sel:
+            return
+        if messagebox.askyesno("Remove Want", "Remove this want from the list?",
+                                parent=self):
+            delete_want(int(sel[0]))
+            self._refresh()
+
+
 # ── Customers Tab ─────────────────────────────────────────────────────────────
 class CustomersFrame(ctk.CTkFrame):
     def __init__(self, parent):
@@ -3144,6 +3353,9 @@ class CustomersFrame(ctk.CTkFrame):
         ctk.CTkButton(bottom, text="💳  Store Credit", width=140,
                       fg_color="#1f538d", hover_color="#1a4578",
                       command=self._open_credit).pack(side="left", padx=(0, 8))
+        ctk.CTkButton(bottom, text="📋  Wants", width=110,
+                      fg_color="#6a4c93", hover_color="#553d78",
+                      command=self._open_wants).pack(side="left", padx=(0, 8))
         ctk.CTkButton(bottom, text="🗑  Delete Selected", width=150,
                       fg_color="#e63946", hover_color="#c1121f",
                       command=self._delete_selected).pack(side="left")
@@ -3197,6 +3409,13 @@ class CustomersFrame(ctk.CTkFrame):
             messagebox.showinfo("No Selection", "Please select a customer.")
             return
         CreditWindow(self, c, on_save=self.refresh_table)
+
+    def _open_wants(self):
+        c = self._get_selected()
+        if not c:
+            messagebox.showinfo("No Selection", "Please select a customer.")
+            return
+        WantsDialog(self, c)
 
     def _delete_selected(self):
         c = self._get_selected()
